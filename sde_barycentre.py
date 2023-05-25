@@ -55,14 +55,15 @@ class net(nn.Module):
 
 class sde_barycentre():
     
-    def __init__(self, mu, sigma, rho, pi, d=2, T=1, Ndt = 501):
+    def __init__(self, X0, mu, sigma, rho, pi, d=2, T=1, Ndt = 501):
         
         
+        self.X0 = X0
         self.mu = mu
         self.K = len(self.mu)
         self.d = d
         self.sigma = sigma
-        self.rho = torch.tensor(rho).float()
+        self.rho = rho
         self.pi= pi
         
         self.mu_bar = lambda t,x : torch.sum(torch.cat([pi*mu(t,x).unsqueeze(2) 
@@ -82,6 +83,30 @@ class sde_barycentre():
         
         self.loss = []
         
+        self.Z = torch.distributions.MultivariateNormal(torch.zeros(self.d), self.rho)
+        self.sqrt_dt = np.sqrt(self.dt)
+        
+        
+    def step(self, t, x, mu, sigma, dW, dt):
+        
+        s = sigma(t,x)
+        xp = x + mu(t,x) * dt  + s * dW 
+        
+        # Milstein correction
+        m = torch.zeros(x.shape[0],self.d)
+        
+        xc = x.detach().requires_grad_()
+        for k in range(self.d):
+            
+            grad_s = torch.autograd.grad(torch.sum(sigma(t,xc)[:,k]), xc)[0]
+            
+            m[:,k] = 0.5* s[:,k] * grad_s[:,k] * (dW[:,k]**2-dt)
+            
+        xp += m
+        
+        return xp
+        
+        
     def simulate(self, batch_size = 256):
         """
         simulate paths under all measures and the mean measure
@@ -99,24 +124,17 @@ class sde_barycentre():
         """
         
         X = torch.zeros(batch_size, self.Ndt, self.d, self.K+1)
-        
-        Z = torch.distributions.MultivariateNormal(torch.zeros(self.d), self.rho)
-        
-        sqrt_dt = np.sqrt(self.dt)
+        X[:,0,:,:] = self.X0.view(1,self.d,1).repeat(batch_size,1,1)
         
         for i, t in enumerate(self.t[:-1]):
             
-            # dW = np.sqrt(self.dt[i]) * torch.randn(batch_size, self.d)
-            dW = sqrt_dt[i] * Z.sample((batch_size,))
+            dW = self.sqrt_dt[i] * self.Z.sample((batch_size,))
             
             for k in range(self.K):
                 
-                X[:,i+1,:,k] = X[:,i,:,k] \
-                    + self.dt[i] * self.mu[k](t,X[:,i,:,k]) + self.sigma(t,X[:,i,:,k]) * dW
+                X[:,i+1,:,k] = self.step(t, X[:,i,:,k], self.mu[k], self.sigma, dW, self.dt[i])
             
-            X[:,i+1,:,-1] = X[:,i,:,-1] \
-                + self.dt[i] * self.mu_bar(t,X[:,i,:,-1]) \
-                    + self.sigma(t,X[:,i,:,-1]) * dW
+            X[:,i+1,:,-1] = self.step(t, X[:,i,:,-1], self.mu_bar, self.sigma, dW, self.dt[i])
         
         return X
 
@@ -138,15 +156,13 @@ class sde_barycentre():
         """
         
         X = torch.zeros(batch_size, self.Ndt, self.d)
+        X[:,0,:] = self.X0.view(1,self.d).repeat(batch_size,1)
+        
         var_sigma = torch.zeros(batch_size, self.Ndt)
-        
-        Z = torch.distributions.MultivariateNormal(torch.zeros(self.d), self.rho)
-        
-        sqrt_dt = np.sqrt(self.dt)
         
         for i, t in enumerate(self.t[:-1]):
             
-            dW = sqrt_dt[i] * Z.sample((batch_size,))
+            dW = self.sqrt_dt[i] * self.Z.sample((batch_size,))
         
             sigma = self.sigma(t,X[:,i,:])
             mu_bar = self.mu_bar(t,X[:,i,:])
@@ -159,11 +175,11 @@ class sde_barycentre():
                 
                 var_sigma[:,i] += self.pi[k]*torch.einsum("ij,ijk,ik->i", dmu, inv_Sigma, dmu)
             
-            X[:,i+1,:] = X[:,i,:] + self.dt[i] * mu_bar + sigma * dW
+            X[:,i+1,:] = self.step(t, X[:,i,:], self.mu_bar, self.sigma, dW, self.dt[i])
         
         return X, var_sigma
     
-    def __estimate_L__(self, batch_size = 1024, n_iter=10_000):
+    def train(self, batch_size = 1024, n_iter=10_000, n_print=100):
         
         t = torch.tensor(self.t).float().view(1,-1,1).repeat(batch_size,1,1)
         
@@ -187,8 +203,9 @@ class sde_barycentre():
             
             self.loss.append(loss.item())
             
-            if np.mod(i+1, 100) ==0:
+            if np.mod(i+1, n_print) ==0:
                 self.plot_loss()
+                self.plot_sample_qpaths(256)
             
             
         return 0
@@ -226,9 +243,9 @@ class sde_barycentre():
                 axs[i,k].plot(self.t, X[0,:,i,k].T, color='b', linewidth=1)
                
         for k in range(self.K):
-            axs[0,k].set_title('model-' + str(k))
+            axs[0,k].set_title('model $\mathbb{P}_' + str(k) + '$')
         
-        axs[0,-1].set_title('model-bar')
+        axs[0,-1].set_title('model $\overline{\mathbb{P}}$')
         
         for i in range(self.d):
             axs[i,0].set_ylabel(r'$X_{' + str(i) +'}$')
@@ -267,4 +284,89 @@ class sde_barycentre():
         plt.plot(mv,  linewidth=1.5)
         plt.yscale('log')
         plt.show()
+        
+    def simulate_q(self, batch_size = 256):
+
+        X = torch.zeros(batch_size, self.Ndt, self.d)
+        X[:,0,:] = self.X0.view(1,self.d).repeat(batch_size,1)
+        
+        ones = torch.ones(batch_size, 1)
+        
+        
+        def theta(t,x):
+            sigma = self.sigma(t,x)
+            mu_bar = self.mu_bar(t,x)
+            
+            Sigma = sigma.unsqueeze(axis=1) * self.rho.unsqueeze(axis=0) * sigma.unsqueeze(axis=2)
+            
+            grad_L = self.grad_L(t, x)
+            
+            return mu_bar - torch.einsum("ijk,ik->ij", Sigma, grad_L)
+        
+        for i, t in enumerate(self.t[:-1]):
+            
+            dW = self.sqrt_dt[i] * self.Z.sample((batch_size,))
+        
+            # sigma = self.sigma(t,X[:,i,:])
+            # mu_bar = self.mu_bar(t,X[:,i,:])
+            
+            # Sigma = sigma.unsqueeze(axis=1) * self.rho.unsqueeze(axis=0) * sigma.unsqueeze(axis=2)
+            
+            # grad_L = self.grad_L(t*ones, X[:,i,:])
+            
+            # theta = mu_bar - torch.einsum("ijk,ik->ij", Sigma, grad_L)
+            
+            # X[:,i+1,:] = X[:,i,:] + self.dt[i] * theta + sigma * dW
+            X[:,i+1,:] = self.step(t*ones, X[:,i,:], theta, self.sigma, dW, self.dt[i])
+        
+        return X        
+        
+    def plot_sample_qpaths(self, batch_size = 4_096):
+        """
+        simulate paths under the optimal measure and plot them
+
+        Parameters
+        ----------
+        batch_size : TYPE, optional
+            DESCRIPTION. The default is 4_096.
+
+        Returns
+        -------
+        None.
+
+        """
+        
+        print('start sim')
+        X = self.simulate_q(batch_size).numpy()
+        
+        print('done sim')
+        
+        
+        fig, axs = plt.subplots(self.d, 1,  figsize=(4,5), sharex=True)
+        
+        for i in range(self.d):
+            
+            qtl = np.quantile(X[:,:,i], [0.1, 0.5, 0.9], axis=0)
+            axs[i].plot(self.t, X[:500,:,i].T, alpha=0.25, linewidth=1)
+            axs[i].plot(self.t, qtl.T, color='k', linestyle='--',linewidth=1)
+            axs[i].plot(self.t, X[0,:,i].T, color='b', linewidth=1)
+               
+        axs[0].set_title('model $\mathbb{Q}^*$')
+        
+        for i in range(self.d):
+            axs[i].set_ylabel(r'$X_{' + str(i) +'}$')
+        
+        fig.add_subplot(111, frameon=False)      
+        plt.tick_params(labelcolor='none', which='both', top=False, bottom=False, left=False, right=False)
+        plt.xlabel(r'$t$')               
+            
+        plt.tight_layout()
+        plt.show()
+        
+    def grad_L(self, t, X):
+        
+        X = X.detach().requires_grad_()
+        L = - torch.sum( torch.log(  self.omega(torch.cat((t,X), axis=1)) ) )
+        
+        return torch.autograd.grad(L, X)[0]
         
