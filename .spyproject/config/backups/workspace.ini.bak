@@ -4,7 +4,7 @@ save_data_on_exit = True
 save_history = True
 save_non_project_files = False
 project_type = 'empty-project-type'
-recent_files = ['barycenter\\sde_barycentre.py', 'barycenter\\main_sde_barycentre.py']
+recent_files = ['barycenter\\main_sde_barycentre.py', 'barycenter\\sde_barycentre.py']
 
 [main]
 version = 0.2.0

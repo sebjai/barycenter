@@ -27,7 +27,8 @@ class net(nn.Module):
                  nOut, 
                  n_nodes = 36, 
                  n_layers=5,
-                 device='cpu'):
+                 device='cpu',
+                 output='none'):
         super(net, self).__init__()
 
         self.device = device
@@ -41,6 +42,8 @@ class net(nn.Module):
         self.softplus = nn.Softplus()
         self.sigmoid = nn.Sigmoid()
         
+        self.output=output
+        
         
     def forward(self, x):
         
@@ -48,20 +51,24 @@ class net(nn.Module):
         for linear in self.hidden_to_hidden:
             h = self.g(linear(h))
             
-        output = self.softplus(self.hidden_to_out(h))
+        h = self.hidden_to_out(h)
         
-        return output
+        if self.output=='softplus':
+            h = self.softplus(h)
+        
+        return h
 
 
 class sde_barycentre():
     
-    def __init__(self, X0, mu, sigma, rho, pi, d=2, T=1, Ndt = 501):
+    def __init__(self, X0, mu, sigma, rho, pi, f=[], g=[], T=1, Ndt = 501):
         
-        
+        self.f = f
+        self.g = g
         self.X0 = X0
         self.mu = mu
         self.K = len(self.mu)
-        self.d = d
+        self.d = X0.shape[0]
         self.sigma = sigma
         self.rho = rho
         self.pi= pi
@@ -73,36 +80,45 @@ class sde_barycentre():
         self.T = T
         self.Ndt = Ndt
         self.t = np.linspace(0,self.T, self.Ndt)
-        self.dt = np.diff(self.t)
+        self.dt = self.t[1]-self.t[0]
         
-        self.omega = net(self.d+1, 1)
-        self.optimizer = optim.AdamW(self.omega.parameters(), lr=0.001)
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer,
-                                              step_size=10,
-                                              gamma=0.99)
+        # features are t, x_1,..,x_d, eta_1,..,eta_n for constraints
+        self.omega = net(nIn=self.d+1+len(self.f)+len(self.g), 
+                         nOut=1, output='softplus')
+        self.omega_optimizer = optim.AdamW(self.omega.parameters(), lr=0.001)
+        self.omega_scheduler = optim.lr_scheduler.StepLR(self.omega_optimizer,
+                                                         step_size=10,
+                                                         gamma=0.999)
         
-        self.loss = []
+        self.eta = net(nIn=1, nOut=len(self.f)+len(self.g), 
+                       n_nodes=16, n_layers=2)
+        self.eta_optimizer = optim.AdamW(self.eta.parameters(), lr=0.001)
+        self.eta_scheduler = optim.lr_scheduler.StepLR(self.eta_optimizer,
+                                                       step_size=10,
+                                                       gamma=0.999)
+        
+        self.omega_loss = []
+        self.eta_loss = []
         
         self.Z = torch.distributions.MultivariateNormal(torch.zeros(self.d), self.rho)
         self.sqrt_dt = np.sqrt(self.dt)
-        
         
     def step(self, t, x, mu, sigma, dW, dt):
         
         s = sigma(t,x)
         xp = x + mu(t,x) * dt  + s * dW 
         
-        # Milstein correction
-        m = torch.zeros(x.shape[0],self.d)
+        # # Milstein correction
+        # m = torch.zeros(x.shape[0],self.d)
         
-        xc = x.detach().requires_grad_()
-        for k in range(self.d):
+        # xc = x.detach().requires_grad_()
+        # for k in range(self.d):
             
-            grad_s = torch.autograd.grad(torch.sum(sigma(t,xc)[:,k]), xc)[0]
+        #     grad_s = torch.autograd.grad(torch.sum(sigma(t,xc)[:,k]), xc)[0]
             
-            m[:,k] = 0.5* s[:,k] * grad_s[:,k] * (dW[:,k]**2-dt)
+        #     m[:,k] = 0.5* s[:,k] * grad_s[:,k] * (dW[:,k]**2-dt)
             
-        xp += m
+        # xp += m
         
         return xp
         
@@ -128,13 +144,13 @@ class sde_barycentre():
         
         for i, t in enumerate(self.t[:-1]):
             
-            dW = self.sqrt_dt[i] * self.Z.sample((batch_size,))
+            dW = self.sqrt_dt * self.Z.sample((batch_size,))
             
             for k in range(self.K):
                 
-                X[:,i+1,:,k] = self.step(t, X[:,i,:,k], self.mu[k], self.sigma, dW, self.dt[i])
+                X[:,i+1,:,k] = self.step(t, X[:,i,:,k], self.mu[k], self.sigma, dW, self.dt)
             
-            X[:,i+1,:,-1] = self.step(t, X[:,i,:,-1], self.mu_bar, self.sigma, dW, self.dt[i])
+            X[:,i+1,:,-1] = self.step(t, X[:,i,:,-1], self.mu_bar, self.sigma, dW, self.dt)
         
         return X
 
@@ -162,7 +178,7 @@ class sde_barycentre():
         
         for i, t in enumerate(self.t[:-1]):
             
-            dW = self.sqrt_dt[i] * self.Z.sample((batch_size,))
+            dW = self.sqrt_dt * self.Z.sample((batch_size,))
         
             sigma = self.sigma(t,X[:,i,:])
             mu_bar = self.mu_bar(t,X[:,i,:])
@@ -175,38 +191,124 @@ class sde_barycentre():
                 
                 var_sigma[:,i] += self.pi[k]*torch.einsum("ij,ijk,ik->i", dmu, inv_Sigma, dmu)
             
-            X[:,i+1,:] = self.step(t, X[:,i,:], self.mu_bar, self.sigma, dW, self.dt[i])
+            X[:,i+1,:] = self.step(t, X[:,i,:], self.mu_bar, self.sigma, dW, self.dt)
         
         return X, var_sigma
     
-    def train(self, batch_size = 1024, n_iter=10_000, n_print=100):
+    
+    def simulate_q(self, eta, batch_size = 256):
+
+        X = torch.zeros(batch_size, self.Ndt, self.d)
+        X[:,0,:] = self.X0.view(1,self.d).repeat(batch_size,1)
         
-        t = torch.tensor(self.t).float().view(1,-1,1).repeat(batch_size,1,1)
+        ones = torch.ones(batch_size, 1)
         
-        for i in tqdm(range(n_iter)):
+        
+        def theta(t,x):
+            sigma = self.sigma(t,x)
+            mu_bar = self.mu_bar(t,x)
+            
+            Sigma = sigma.unsqueeze(axis=1) * self.rho.unsqueeze(axis=0) * sigma.unsqueeze(axis=2)
+            
+            grad_L = self.grad_L(t, x, eta)
+            
+            return mu_bar - torch.einsum("ijk,ik->ij", Sigma, grad_L)
+        
+        for i, t in enumerate(self.t[:-1]):
+            
+            dW = self.sqrt_dt * self.Z.sample((batch_size,))
+        
+            X[:,i+1,:] = self.step(t*ones, X[:,i,:], theta, self.sigma, dW, self.dt)
+        
+        return X  
+    
+    def int_tT(self, y):
+        
+        # result = torch.cumsum(y.flip((1,))[:,1:]*torch.tensor(self.dt).float().unsqueeze(axis=0), axis=1).flip((1,))
+        
+        y_flipped = torch.cat((torch.zeros(y.shape[0],1),y.flip((1,))[:,1:]),axis=1)
+        result = torch.cumsum(y_flipped*self.dt, axis=1).flip((1,))
+        
+        return result
+    
+    def update_omega(self, n_iter=10, batch_size=256):
+        
+        for i in range(n_iter):
+            
+            eta = self.eta(torch.zeros(batch_size, self.Ndt, 1))
             
             X, var_sigma = self.simulate_pbar(batch_size)
             
-            int_var_sigma = torch.cumsum(var_sigma.flip((1,))[:,1:]*torch.tensor(self.dt).float().unsqueeze(axis=0), axis=1).flip((1,))
+            # running constraints
+            int_g = 0
+            for k in range(len(self.g)):
+                int_g += eta[...,k]*self.int_tT(self.g[k](self.t_train, X).squeeze())
             
-            g = self.omega(torch.cat((t,X), axis=2))
+            # terminal constraints
+            F = 0
+            for k in range(len(self.f)):
+                F += eta[...,len(self.g)+k]*self.f[k](X).squeeze()
             
+            int_var_sigma = self.int_tT(var_sigma)
             
-            self.optimizer.zero_grad()
+            omega = self.omega(torch.cat((self.t_train, X, eta), axis=2))
             
-            loss = torch.mean( (g[:,:-1,0] - torch.exp(-0.5*int_var_sigma) )**2 )
+            loss = torch.mean( (omega[...,0] - torch.exp(F+int_g-0.5*int_var_sigma) )**2 )
+            
+            self.omega_optimizer.zero_grad()
             
             loss.backward()
             
-            self.optimizer.step()
-            self.scheduler.step()
+            self.omega_optimizer.step()
+            self.omega_scheduler.step()
             
-            self.loss.append(loss.item())
+            self.omega_loss.append(loss.item())        
+        
+    def update_eta(self, batch_size=256):
+        
+        eta = self.eta(torch.zeros(batch_size, 1))
+        
+        X = self.simulate_q(eta, batch_size=batch_size)
+        
+        # running constraints
+        loss = 0
+        for k in range(len(self.g)):
+            loss += torch.mean((torch.sum(self.dt*self.g[k](self.t_train, X)[:,:-1],axis=1))**2)
+
+        # terminal constraint
+        for k in range(len(self.f)):
+            loss += torch.mean((self.f[k](X))**2)
+            
+        self.eta_optimizer.zero_grad()
+        
+        loss.backward()
+        
+        self.eta_optimizer.step()
+        self.eta_scheduler.step()
+        
+        self.eta_loss.append(loss.item())
+        
+    #
+    # add in Lagrange multiplier as feature to NN and added in terminal penalties
+    # can compute using actor-critic methods.
+    #
+    def train(self, batch_size = 1024, n_iter=1_000, n_iter_omega=10, n_print=100):
+        
+        self.t_train = torch.tensor(self.t).float().view(1,-1,1).repeat(batch_size,1,1)        
+        
+        self.eta_hist = []
+        
+        for i in tqdm(range(n_iter)):
+            
+            self.update_omega(n_iter=n_iter_omega, batch_size=batch_size)
+            
+            self.update_eta(batch_size=batch_size)
+            self.eta_hist.append(self.eta(torch.zeros(1)).detach().numpy())
             
             if np.mod(i+1, n_print) ==0:
-                self.plot_loss()
+                self.plot_loss(self.omega_loss, r'$\omega$')
+                self.plot_loss(self.eta_loss, r'$\eta$')
                 self.plot_sample_qpaths(256)
-            
             
         return 0
     
@@ -232,6 +334,9 @@ class sde_barycentre():
         
         
         fig, axs = plt.subplots(self.d, self.K+1, figsize=(10, 5), sharex=True)
+        
+        if len(axs.shape)==1:
+            axs = np.expand_dims(axs, axis=0)
         
         for i in range(self.d):
             
@@ -276,50 +381,15 @@ class sde_barycentre():
                 
         return y, y_err
         
-    def plot_loss(self):
+    def plot_loss(self, x, title=""):
 
-        mv, mv_err = self.moving_average(self.loss,100)
+        mv, mv_err = self.moving_average(x,100)
         
         plt.fill_between(np.arange(len(mv)), y1=mv-mv_err, y2=mv+mv_err, alpha=0.2)
         plt.plot(mv,  linewidth=1.5)
         plt.yscale('log')
+        plt.title(title)
         plt.show()
-        
-    def simulate_q(self, batch_size = 256):
-
-        X = torch.zeros(batch_size, self.Ndt, self.d)
-        X[:,0,:] = self.X0.view(1,self.d).repeat(batch_size,1)
-        
-        ones = torch.ones(batch_size, 1)
-        
-        
-        def theta(t,x):
-            sigma = self.sigma(t,x)
-            mu_bar = self.mu_bar(t,x)
-            
-            Sigma = sigma.unsqueeze(axis=1) * self.rho.unsqueeze(axis=0) * sigma.unsqueeze(axis=2)
-            
-            grad_L = self.grad_L(t, x)
-            
-            return mu_bar - torch.einsum("ijk,ik->ij", Sigma, grad_L)
-        
-        for i, t in enumerate(self.t[:-1]):
-            
-            dW = self.sqrt_dt[i] * self.Z.sample((batch_size,))
-        
-            # sigma = self.sigma(t,X[:,i,:])
-            # mu_bar = self.mu_bar(t,X[:,i,:])
-            
-            # Sigma = sigma.unsqueeze(axis=1) * self.rho.unsqueeze(axis=0) * sigma.unsqueeze(axis=2)
-            
-            # grad_L = self.grad_L(t*ones, X[:,i,:])
-            
-            # theta = mu_bar - torch.einsum("ijk,ik->ij", Sigma, grad_L)
-            
-            # X[:,i+1,:] = X[:,i,:] + self.dt[i] * theta + sigma * dW
-            X[:,i+1,:] = self.step(t*ones, X[:,i,:], theta, self.sigma, dW, self.dt[i])
-        
-        return X        
         
     def plot_sample_qpaths(self, batch_size = 4_096):
         """
@@ -335,14 +405,18 @@ class sde_barycentre():
         None.
 
         """
+        eta = self.eta(torch.zeros(batch_size,1))
         
         print('start sim')
-        X = self.simulate_q(batch_size).numpy()
+        X = self.simulate_q(eta, batch_size=batch_size).numpy()
         
         print('done sim')
         
         
         fig, axs = plt.subplots(self.d, 1,  figsize=(4,5), sharex=True)
+        
+        if self.d == 1:
+            axs = np.array([axs])
         
         for i in range(self.d):
             
@@ -363,10 +437,21 @@ class sde_barycentre():
         plt.tight_layout()
         plt.show()
         
-    def grad_L(self, t, X):
+    # def grad_L(self, t, X, eta):
         
-        X = X.detach().requires_grad_()
-        L = - torch.sum( torch.log(  self.omega(torch.cat((t,X), axis=1)) ) )
+    #     X = X.detach().requires_grad_()
+    #     L = - torch.sum( torch.log(  self.omega(torch.cat((t,X,eta), axis=1)) ) )
         
-        return torch.autograd.grad(L, X)[0]
+    #     return torch.autograd.grad(L, X)[0]
+    
+    
+    def grad_L(self, t, X, eta):
         
+        eps=0.0001
+        omega = self.omega(torch.cat((t,X,eta), axis=1))
+        omega_p = self.omega(torch.cat((t,X-eps,eta), axis=1))
+        omega_m = self.omega(torch.cat((t,X+eps,eta), axis=1))
+
+        grad_L = (omega_p-omega_m)/(2*eps)/omega
+        
+        return grad_L
