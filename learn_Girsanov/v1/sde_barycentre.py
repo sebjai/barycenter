@@ -13,19 +13,17 @@ import pdb
 import numpy as np
 import matplotlib.pyplot as plt
 
+from scipy.optimize import fsolve
+from scipy.optimize import minimize
 from tqdm import tqdm
-
-import copy
-
-import dill
-from datetime import datetime
+from numpy.random import choice
 
 class net(nn.Module):
     
     def __init__(self, 
                  nIn, 
                  nOut, 
-                 n_nodes = 36, 
+                 n_nodes=128, 
                  n_layers=5,
                  device='cpu',
                  output='none'):
@@ -71,6 +69,8 @@ class sde_barycentre():
         self.d = X0.shape[0]
         self.sigma = sigma
         self.rho = rho
+        self.U = torch.cholesky(self.rho.unsqueeze(axis=0))        
+        
         self.pi= pi
         
         self.mu_bar = lambda t,x : torch.sum(torch.cat([pi*mu(t,x).unsqueeze(2) 
@@ -82,26 +82,24 @@ class sde_barycentre():
         self.t = np.linspace(0,self.T, self.Ndt)
         self.dt = self.t[1]-self.t[0]
         
-        # features are t, x_1,..,x_d, eta_1,..,eta_n for constraints
-        self.omega = net(nIn=self.d+1+len(self.f)+len(self.g), 
-                         nOut=1, output='softplus')
-        self.omega_optimizer = optim.AdamW(self.omega.parameters(), lr=0.001)
-        self.omega_scheduler = optim.lr_scheduler.StepLR(self.omega_optimizer,
-                                                         step_size=10,
-                                                         gamma=0.999)
-        
-        self.eta = net(nIn=1, nOut=len(self.f)+len(self.g), 
-                       n_nodes=16, n_layers=2)
-        self.eta_optimizer = optim.AdamW(self.eta.parameters(), lr=0.001)
-        self.eta_scheduler = optim.lr_scheduler.StepLR(self.eta_optimizer,
-                                                       step_size=10,
-                                                       gamma=0.999)
-        
-        self.omega_loss = []
-        self.eta_loss = []
+        # features are t, x_1,..,x_dm 
+        self.theta = self.get_net(nIn=1+self.d, nOut=self.d, output=None)
         
         self.Z = torch.distributions.MultivariateNormal(torch.zeros(self.d), self.rho)
         self.sqrt_dt = np.sqrt(self.dt)
+        
+    def get_net(self, nIn, nOut, output):
+
+        obj = {'net' : net(nIn=nIn, nOut=nOut, output=output) }
+        obj['optimizer'] = optim.AdamW(obj['net'].parameters(), lr=0.001)
+        obj['scheduler'] = optim.lr_scheduler.StepLR(obj['optimizer'],
+                                                     step_size=1000,
+                                                     gamma=0.999)
+        obj['loss'] = []        
+
+        return obj
+        
+        
         
     def step(self, t, x, mu, sigma, dW, dt):
         
@@ -155,7 +153,7 @@ class sde_barycentre():
         return X
 
 
-    def simulate_pbar(self, batch_size = 256):
+    def simulate_Qbar(self, batch_size = 256):
         """
         simulate paths under the mean measure
 
@@ -172,13 +170,14 @@ class sde_barycentre():
         """
         
         X = torch.zeros(batch_size, self.Ndt, self.d)
+        dW = torch.zeros(batch_size, self.Ndt, self.d)
         X[:,0,:] = self.X0.view(1,self.d).repeat(batch_size,1)
         
         var_sigma = torch.zeros(batch_size, self.Ndt)
         
         for i, t in enumerate(self.t[:-1]):
             
-            dW = self.sqrt_dt * self.Z.sample((batch_size,))
+            dW[:,i,:] = self.sqrt_dt * self.Z.sample((batch_size,))
         
             sigma = self.sigma(t,X[:,i,:])
             mu_bar = self.mu_bar(t,X[:,i,:])
@@ -189,30 +188,21 @@ class sde_barycentre():
             for k in range(self.K):
                 dmu = (self.mu[k](t,X[:,i,:]) - mu_bar)
                 
-                var_sigma[:,i] += self.pi[k]*torch.einsum("ij,ijk,ik->i", dmu, inv_Sigma, dmu)
+                var_sigma[:,i] += 0.5*self.pi[k]*torch.einsum("ij,ijk,ik->i", dmu, inv_Sigma, dmu)
             
-            X[:,i+1,:] = self.step(t, X[:,i,:], self.mu_bar, self.sigma, dW, self.dt)
-        
-        return X, var_sigma
+            X[:,i+1,:] = self.step(t, X[:,i,:], self.mu_bar, self.sigma, dW[:,i,:], self.dt)
+            
+        return X, var_sigma, dW
     
-    
-    def simulate_q(self, eta, batch_size = 256):
+    def simulate_Q(self, batch_size = 256):
 
         X = torch.zeros(batch_size, self.Ndt, self.d)
         X[:,0,:] = self.X0.view(1,self.d).repeat(batch_size,1)
         
         ones = torch.ones(batch_size, 1)
         
+        theta = lambda t,x : self.theta(torch.cat((t,x),axis=-1))
         
-        def theta(t,x):
-            sigma = self.sigma(t,x)
-            mu_bar = self.mu_bar(t,x)
-            
-            Sigma = sigma.unsqueeze(axis=1) * self.rho.unsqueeze(axis=0) * sigma.unsqueeze(axis=2)
-            
-            grad_L = self.grad_L(t, x, eta)
-            
-            return mu_bar - torch.einsum("ijk,ik->ij", Sigma, grad_L)
         
         for i, t in enumerate(self.t[:-1]):
             
@@ -224,93 +214,179 @@ class sde_barycentre():
     
     def int_tT(self, y):
         
-        # result = torch.cumsum(y.flip((1,))[:,1:]*torch.tensor(self.dt).float().unsqueeze(axis=0), axis=1).flip((1,))
-        
-        y_flipped = torch.cat((torch.zeros(y.shape[0],1),y.flip((1,))[:,1:]),axis=1)
+        y_flipped = torch.cat((torch.zeros(y.shape[0],1), y.flip((1,))[:,1:]),axis=1)
         result = torch.cumsum(y_flipped*self.dt, axis=1).flip((1,))
         
         return result
     
-    def update_omega(self, n_iter=10, batch_size=256):
+    def cumsum(self, x):
+        cx = torch.cumsum(x, axis=-1)
+        zeros = torch.zeros(cx.shape[:-1]).unsqueeze(-1)
+        cx = torch.cat((zeros, cx[...,:-1]), axis=-1)
         
-        for i in range(n_iter):
+        return cx
+    
+    def get_stoch_exp(self, t, X, dW, theta):
+        
+        sigma = self.sigma(t,X)
+        mu_bar = self.mu_bar(t,X)
+        
+        lam = (mu_bar-theta)/sigma
+        
+        a = torch.einsum("...ij,...ij->...i", lam, dW)
+        A = torch.sum(a[...,:-1], axis=-1)
+        
+        b = torch.einsum("...ij,...ijk,...ik->...i", lam, self.rho.unsqueeze(axis=0), lam)
+        B = torch.sum(b[...,:-1]* self.dt, axis=-1) 
+        
+        return torch.exp(-0.5*B - A)
             
-            eta = self.eta(torch.zeros(batch_size, self.Ndt, 1))
+    def cost(self, t, X, theta):
+        
+        sigma = self.sigma(t,X)
+        Sigma = torch.einsum("...ij,...jk,...ik->...ijk", sigma, self.rho, sigma)
+        inv_Sigma = torch.linalg.inv(Sigma)
+        
+        cost = 0
+        for k in range(len(self.mu)):
+            mu = self.mu[k](t, X)
+            dtheta = (theta-mu)
+            A = torch.einsum("...ij,...ijk,...ik->...i", dtheta, inv_Sigma, dtheta)
+            cost += 0.5*self.pi[k]*torch.sum( A*self.dt, axis=-1)
             
-            X, var_sigma = self.simulate_pbar(batch_size)
+        return cost
+    
+    def learn_theta(self, n_iter=10, n_print=100, batch_size=256):
+        
+        t = torch.tensor(self.t).float().view(1,-1,1).repeat(batch_size,1,1)  
+        self.F = []
+        for i in tqdm(range(n_iter)):
             
-            # running constraints
-            int_g = 0
-            for k in range(len(self.g)):
-                int_g += eta[...,k]*self.int_tT(self.g[k](self.t_train, X).squeeze())
+            # X, var_sigma = self.simulate_Qbar(batch_size=batch_size)
+            mask = torch.randint(self.X.shape[0], (batch_size,))
+            X = self.X[mask]
+            var_sigma = self.var_sigma[mask]
+            dW = self.dW[mask]
+            
+            theta = self.theta['net'](torch.cat((t,X), axis=-1))
+            
+            dQ_dQbar = self.get_stoch_exp(t, X, dW, theta)
             
             # terminal constraints
             F = 0
             for k in range(len(self.f)):
-                F += eta[...,len(self.g)+k]*self.f[k](X).squeeze()
+                F += self.eta[len(self.g)+k]*self.f[k](X[:,-1,0])
+            
+            
+            # # running constraints
+            int_g = 0
+            # for k in range(len(self.g)):
+            #     int_g += eta[k]*self.int_tT(self.g[k](self.t_train, X).squeeze() )
+
             
             int_var_sigma = self.int_tT(var_sigma)
             
-            omega = self.omega(torch.cat((self.t_train, X, eta), axis=2))
+            cost = self.cost(t, X, theta)
             
-            loss = torch.mean( (omega[...,0] - torch.exp(F+int_g-0.5*int_var_sigma) )**2 )
+            self.F.append(torch.mean(dQ_dQbar*F).detach().numpy())
             
-            self.omega_optimizer.zero_grad()
+            loss = torch.mean( dQ_dQbar*cost  )
+            loss += torch.mean(dQ_dQbar*F)**2
+            
+            self.theta['optimizer'].zero_grad()
             
             loss.backward()
             
-            self.omega_optimizer.step()
-            self.omega_scheduler.step()
+            self.theta['optimizer'].step()
+            self.theta['scheduler'].step()
             
-            self.omega_loss.append(loss.item())        
+            self.theta['loss'].append(np.sqrt(loss.item()))
+            
+            if np.mod(i+1,n_print) == 0:
+                self.plot_loss(self.theta['loss'],r"$loss_\omega$")
+                self.plot_mu()
+                # self.plot_sample_qpaths(eta, batch_size=1_000)
+                f_err, g_err = self.estimate_errors(batch_size=1_000)
+                print("\nerrors ", f_err, g_err)
+            
+    def estimate_errors(self, batch_size=1_000):
         
-    def update_eta(self, batch_size=256):
+        X = self.simulate_q(batch_size=batch_size)
+        g_err = []
+        for k in range(len(self.g)):
+            g_err.append(torch.mean(torch.sum(self.dt*self.g[k](self.t_train[:,:-1,:], X[:,:-1,:]), axis=1)).detach().numpy())
         
-        eta = self.eta(torch.zeros(batch_size, 1))
+        f_err = []
+        for k in range(len(self.f)):
+            f_err.append(torch.mean(self.f[k](X[:,-1,:])).detach().numpy())
+            
+        return f_err, g_err
         
-        X = self.simulate_q(eta, batch_size=batch_size)
+    def get_dQdQbar_T(self, eta, X, var_sigma):
         
         # running constraints
-        loss = 0
+        int_g = 0
         for k in range(len(self.g)):
-            loss += torch.mean((torch.sum(self.dt*self.g[k](self.t_train, X)[:,:-1],axis=1))**2)
-
-        # terminal constraint
+            int_g += eta[k]*torch.sum(self.dt*self.g[k](self.t_train[:,:-1,:], X[:,:-1,:]), axis=1)
+        
+        # terminal constraints
+        F = 0
         for k in range(len(self.f)):
-            loss += torch.mean((self.f[k](X))**2)
+            F += eta[len(self.g)+k]*self.f[k](X[:,-1,:])
+        
+        int_var_sigma = 0.5*torch.sum(self.dt*var_sigma, axis=1).reshape(-1,1)
+        
+        dQ_dQbar = torch.exp(-F-int_g - int_var_sigma)
+        mean = torch.mean(dQ_dQbar, axis=0)
+        dQ_dQbar = dQ_dQbar / mean
+        
+        return dQ_dQbar
+    
+    def find_eta(self, batch_size):
+        
+        print("finding eta")
+        
+        t = torch.tensor(self.t).float().view(1,-1,1).repeat(batch_size,1,1)  
+        
+        def error(eta):
             
-        self.eta_optimizer.zero_grad()
+            dQ_dQbar = self.get_dQdQbar_T(eta, self.X, self.var_sigma)
+            
+            loss = np.zeros(len(eta))
+            # running constraints
+            for k in range(len(self.g)):
+                loss[k] = torch.mean(dQ_dQbar * (torch.sum(self.dt*self.g[k](t, self.X)[:,:-1,:],axis=1)) ) 
+                
+            for k in range(len(self.f)):
+                loss[k+len(self.g)] = torch.mean(dQ_dQbar * (self.f[k](self.X[:,-1,:])))
+                
+            self.eta.append(1*eta)
+            
+            print(eta, loss)
+                
+            return loss
         
-        loss.backward()
+        result = fsolve(lambda y : error(y), 0.1*np.ones(len(self.g)+len(self.f)))
+        # result = minimize(lambda y : error(y), 0.1*np.ones(len(self.g)+len(self.f)), method='nelder-mead', options={'xatol': 1e-8, 'disp': True})
         
-        self.eta_optimizer.step()
-        self.eta_scheduler.step()
-        
-        self.eta_loss.append(loss.item())
+        self.eta = result
         
     #
     # add in Lagrange multiplier as feature to NN and added in terminal penalties
     # can compute using actor-critic methods.
     #
-    def train(self, batch_size = 1024, n_iter=1_000, n_iter_omega=10, n_print=100):
+    def train(self, batch_size = 1024, n_iter_eta=1_000,  
+              n_iter_omega=1_000, n_print=100):
         
-        self.t_train = torch.tensor(self.t).float().view(1,-1,1).repeat(batch_size,1,1)        
+        self.X, self.var_sigma, self.dW = self.simulate_Qbar(batch_size=10_000)
+        self.eta = []
         
-        self.eta_hist = []
+        # self.plot_sample_qpaths(256)
         
-        for i in tqdm(range(n_iter)):
-            
-            self.update_omega(n_iter=n_iter_omega, batch_size=batch_size)
-            
-            self.update_eta(batch_size=batch_size)
-            self.eta_hist.append(self.eta(torch.zeros(1)).detach().numpy())
-            
-            if np.mod(i+1, n_print) ==0:
-                self.plot_loss(self.omega_loss, r'$\omega$')
-                self.plot_loss(self.eta_loss, r'$\eta$')
-                self.plot_sample_qpaths(256)
-            
-        return 0
+        eta = self.find_eta(batch_size = 10_000)
+        
+        self.learn_theta(n_iter=n_iter_omega, n_print=n_print, batch_size=batch_size)
+        
     
     def plot_sample_paths(self, batch_size = 4_096):
         """
@@ -391,7 +467,7 @@ class sde_barycentre():
         plt.title(title)
         plt.show()
         
-    def plot_sample_qpaths(self, batch_size = 4_096):
+    def plot_sample_qpaths(self, eta, batch_size = 4_096):
         """
         simulate paths under the optimal measure and plot them
 
@@ -405,12 +481,11 @@ class sde_barycentre():
         None.
 
         """
-        eta = self.eta(torch.zeros(batch_size,1))
-        
+        state = torch.get_rng_state()
         torch.manual_seed(12317874321)
         
         print('start sim')
-        X = self.simulate_q(eta, batch_size=batch_size).detach().numpy()
+        X = self.simulate_q(batch_size=batch_size).detach().numpy()
         
         print('done sim')
         
@@ -434,6 +509,7 @@ class sde_barycentre():
         
         for i in range(self.d):
             axs[i].set_ylabel(r'$X_{' + str(i) +'}$')
+            axs[i].set_ylim(-1,2)
         
         fig.add_subplot(111, frameon=False)      
         plt.tick_params(labelcolor='none', which='both', top=False, bottom=False, left=False, right=False)
@@ -442,21 +518,67 @@ class sde_barycentre():
         plt.tight_layout()
         plt.show()
         
-    # def grad_L(self, t, X, eta):
+        torch.set_rng_state(state)
         
-    #     X = X.detach().requires_grad_()
-    #     L = - torch.sum( torch.log(  self.omega(torch.cat((t,X,eta), axis=1)) ) )
+        return X
         
-    #     return torch.autograd.grad(L, X)[0]
-    
-    
-    def grad_L(self, t, X, eta):
+    def plot_mu(self):
         
-        eps=0.0001
-        omega = self.omega(torch.cat((t,X,eta), axis=1))
-        omega_p = self.omega(torch.cat((t,X-eps,eta), axis=1))
-        omega_m = self.omega(torch.cat((t,X+eps,eta), axis=1))
-
-        grad_L = (omega_p-omega_m)/(2*eps)/omega
+        tm, xm = torch.meshgrid(torch.linspace(0,self.T,51),
+                                torch.linspace(-2,2,51))
         
-        return grad_L
+        tm = tm.unsqueeze(axis=2)
+        xm = xm.unsqueeze(axis=2)
+        
+        theta = self.theta(tm, xm).squeeze() 
+        
+        plt.contourf(tm.squeeze() .numpy(),
+                     xm.squeeze() .numpy(),
+                     theta.detach().numpy())
+        plt.show()
+        
+    def sample_dq_dqbar(self, eta, X, var_sigma):
+        
+        
+        dQ_dQbar = self.get_dQdQbar_T(eta, X, var_sigma).detach().numpy()
+        p = dQ_dQbar.reshape(-1)
+        p /= np.sum(p)
+        
+        draw = choice(np.arange(X.shape[0]), X.shape[0], p=p)
+        
+        
+        def makeplot(X_sample):
+        
+            fig, axs = plt.subplots(self.d, 1,  figsize=(6,4), sharex=True)
+            
+            if self.d == 1:
+                axs = np.array([axs])
+            
+            for i in range(self.d):
+                
+                qtl = np.quantile(X_sample[:,:,i], np.arange(1,10)/10, axis=0)
+                
+                plt.fill_between(self.t, qtl[0], qtl[-1], color='y', alpha=0.5)
+                axs[i].plot(self.t, X_sample[:500,:,i].T, alpha=0.1, linewidth=1)
+                axs[i].plot(self.t, qtl.T, color='k', linestyle='--',linewidth=1)
+                axs[i].plot(self.t, X_sample[0,:,i], color='b', linewidth=1)
+                
+                   
+            axs[0].set_title('model $\mathbb{Q}^*$')
+            
+            for i in range(self.d):
+                axs[i].set_ylabel(r'$X_{' + str(i) +'}$')
+                axs[i].set_ylim(-1,2)
+            
+            fig.add_subplot(111, frameon=False)      
+            plt.tick_params(labelcolor='none', which='both', top=False, bottom=False, left=False, right=False)
+            plt.xlabel(r'$t$')               
+                
+            plt.tight_layout()
+            plt.show()
+        
+        makeplot(X)
+        makeplot(X[draw])
+        
+        return X[draw]
+        

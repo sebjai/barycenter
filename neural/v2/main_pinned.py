@@ -98,19 +98,19 @@ f = []
 g = []
 # f.append(lambda x : 1*(x<1.2)*(x>0.8) - 0.95)
 # g.append(lambda t, x: 1*(x<t)-0.2)
-I = lambda x, a : torch.sigmoid((x-a)/0.01)
+I = lambda x, a : torch.sigmoid((x-a)/0.001)
 f.append(lambda x : (1-I(x,1.2))*I(x,0.8) - 0.95)
-g.append(lambda t, x: 1*(1-I(x,t))-0.2)
+g.append(lambda t, x: (1-I(x,t))-0.2)
 
 X0 = torch.tensor([0])
 rho = torch.ones(1,1)
 
 # pi_all = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
 
-pi = [0.5, 0.5]
+pi = [0, 1]
 
 model = sde_barycentre(X0, mu, sigma, rho, pi, f=f, g=g, T=1, Ndt=101)
 X = model.simulate(256)
 
 model.plot_sample_paths()
-model.train(batch_size=256, n_print=50, n_iter =1_000)
+model.train(batch_size=1024, n_print=500, n_iter =5_000)

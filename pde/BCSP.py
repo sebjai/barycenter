@@ -144,7 +144,7 @@ class BCSP():
         
         if self.f is not None:
             
-            transform = lambda a : 50*np.tanh(a)
+            transform = lambda a : 100*np.tanh(a)
                 
             def error(a):
                 

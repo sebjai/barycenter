@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Apr  5 08:55:01 2023
+Created on Sat Mar  2 00:16:49 2024
 
 @author: sebja
 """
@@ -8,8 +8,9 @@ Created on Wed Apr  5 08:55:01 2023
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy import interpolate
-from BCSP import BCSP
+from sde_barycentre import sde_barycentre 
 import pdb
+import torch
 
 #%%
 SMALL_SIZE = 12
@@ -89,76 +90,31 @@ def plot_mu(model, filename):
 mu = []
 # mu.append(lambda t, x: -2*x)
 mu.append(lambda t, x: (4*t-0.7*x))
-mu.append(lambda t, x: 3*(t+np.sin(4*np.pi*t+np.pi/12)-x))
+mu.append(lambda t, x: 3*(t+torch.sin(4*torch.pi*t+torch.pi/12)-x))
 
-sigma = lambda x : 1 
+sigma = lambda t, x : 1*torch.ones(x.shape).to(model.dev) + 1e-20*x
 
-f = lambda x : 1*(x<1.2)*(x>0.8) - 0.95
-# g = lambda t, x: 0
-g = lambda t, x: 0 #(x<0.1+np.sin(2*t))*(x>-0.1+np.sin(2*t))-0.6
+f = []
+g = []
+f.append(lambda x : 1*(x>0.8)*(x<1.2) - 0.95)
+# f.append(lambda x : 0*x)
+
+
+g.append(lambda t, x: 1*(x<t)-0.2)
+# I = lambda x, a : torch.sigmoid((x-a)/0.001)
+# f.append(lambda x : (1-I(x,1.2))*I(x,0.8) - 0.95)
+# g.append(lambda t, x: (1-I(x,t))-0.2)
+
+X0 = torch.tensor([0])
+rho = torch.ones(1,1)
 
 # pi_all = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
 
-pi_all = [0]
+pi = [0.25, 0.75]
 
-state = np.random.get_state()
-n_sims = 10_000
-Ndt = 501
+model = sde_barycentre(X0, mu, sigma, rho, pi, 
+                       f=f, g=g, T=1, Ndt=501)
+# X = model.simulate(256)
 
-np.random.seed(1231241)
-
-Z = np.random.randn(Ndt, n_sims)
-
-for a in pi_all:
-    
-    pi = [a, 0]
-    pi[1] = 1-pi[0]
-    model = BCSP(mu, sigma, pi, f=f, g=g, Z=Z, Ndt=Ndt)
-    
-    eta = model.FindOptimalEta()
-    
-    print("\n\n******")
-    print('eta=', eta)
-    
-    f_err = interpolate.interp1d(model.x, model.QExpectation(eta)[0][0,:])
-    g_err = interpolate.interp1d(model.x, model.QExpectation(eta)[1][0,:])
-    print('E[F]=',f_err(0) )
-    print('$E[\int_0^T g_s\,ds]$=', g_err(0) )
-    
-    paths = model.Simulate()
-    
-    print("******\n\n")
-    
-    if f is not None:
-        print(np.nanmean(f(paths[2][-1,:])))
-    
-    def PlotPaths(paths, title=""):
-        plt.plot(model.t,paths[:,:25], alpha=0.25, linewidth=1)
-        plt.plot(model.t,paths[:,0], color='b', linewidth=1)
-        plt.axhline(1, linestyle='--',color='r')
-        plt.plot(model.t,0.1+np.sin(2*model.t), linestyle='--',color='maroon')
-        plt.plot(model.t,-0.1+np.sin(2*model.t), linestyle='--',color='maroon')
-        
-        q = (1+np.arange(9))/10
-        qtl = np.nanquantile(paths, q, axis=1)
-        for i in range(len(qtl)):
-            plt.plot(model.t, qtl[i], color='gray', linewidth=1)
-        plt.fill_between(model.t, qtl[0], qtl[-1], color='y', alpha=0.2)
-        
-        m = np.mean(paths, axis=1)
-        plt.plot(model.t, m, color='k')
-        # qtl = np.nanquantile(paths, q_bar, axis=1)
-        # plt.plot(model.t, qtl, color='r', linewidth=1)            
-        
-        # lvl = np.mean(paths[-1,:]<x_bar)
-        # qtl = np.nanquantile(paths, lvl, axis=1)
-        # plt.plot(model.t, qtl, color='g', linewidth=1)
-        plt.ylim(-0.5,1.5)
-        plt.xlim(0,1)
-        plt.savefig(title, format='pdf')
-        plt.show()
-        
-    filename = 'pinned2_combined_{0:2.0f}'.format(100*pi[0])
-    PlotPaths(paths[-1], filename + '.pdf')
-    plot_mu(model, filename)
-
+model.plot_sample_paths()
+model.train(batch_size=512, n_print=1000, n_iter_omega= 50_000, n_iter_eta = 1_000)

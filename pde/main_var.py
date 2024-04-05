@@ -91,21 +91,19 @@ mu = []
 mu.append(lambda t, x: (4*t-0.7*x))
 mu.append(lambda t, x: 3*(t+np.sin(4*np.pi*t+np.pi/12)-x))
 
-sigma = lambda x : 1 
+sigma = lambda x : 1
 
-f = lambda x : 1*(x<1.2)*(x>0.8) - 0.95
+f = lambda x : (x<1.2)*(x>0.8) - 0.95
 # g = lambda t, x: 0
-g = lambda t, x: 0 #(x<0.1+np.sin(2*t))*(x>-0.1+np.sin(2*t))-0.6
+g = lambda t, x: 0 #(x<t)-0.5
 
-# pi_all = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
+pi_all = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
 
 pi_all = [0]
 
 state = np.random.get_state()
 n_sims = 10_000
 Ndt = 501
-
-np.random.seed(1231241)
 
 Z = np.random.randn(Ndt, n_sims)
 
@@ -135,9 +133,9 @@ for a in pi_all:
     def PlotPaths(paths, title=""):
         plt.plot(model.t,paths[:,:25], alpha=0.25, linewidth=1)
         plt.plot(model.t,paths[:,0], color='b', linewidth=1)
-        plt.axhline(1, linestyle='--',color='r')
-        plt.plot(model.t,0.1+np.sin(2*model.t), linestyle='--',color='maroon')
-        plt.plot(model.t,-0.1+np.sin(2*model.t), linestyle='--',color='maroon')
+        plt.axhline(0.8, linestyle='--',color='r')
+        plt.axhline(1.2, linestyle='--',color='r')
+        plt.plot(model.t, model.t, linewidth=2, linestyle='--', color='maroon', alpha=1)
         
         q = (1+np.arange(9))/10
         qtl = np.nanquantile(paths, q, axis=1)
@@ -153,12 +151,12 @@ for a in pi_all:
         # lvl = np.mean(paths[-1,:]<x_bar)
         # qtl = np.nanquantile(paths, lvl, axis=1)
         # plt.plot(model.t, qtl, color='g', linewidth=1)
-        plt.ylim(-0.5,1.5)
+        plt.ylim(-1,3)
         plt.xlim(0,1)
         plt.savefig(title, format='pdf')
         plt.show()
         
-    filename = 'pinned2_combined_{0:2.0f}'.format(100*pi[0])
+    filename = 'pinned_combined_{0:2.0f}'.format(100*pi[0])
     PlotPaths(paths[-1], filename + '.pdf')
     plot_mu(model, filename)
 
