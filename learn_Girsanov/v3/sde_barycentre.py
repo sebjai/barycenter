@@ -95,7 +95,7 @@ class sde_barycentre():
         obj = {'net' : net(nIn=nIn, nOut=nOut, mu_bar=mu_bar).to(self.dev) }
         obj['optimizer'] = optim.AdamW(obj['net'].parameters(), lr=0.001)
         obj['scheduler'] = optim.lr_scheduler.StepLR(obj['optimizer'],
-                                                     step_size=1000,
+                                                     step_size=20,
                                                      gamma=0.999)
         obj['loss'] = []        
 
@@ -309,16 +309,16 @@ class sde_barycentre():
             self.theta['loss'].append(np.sqrt(loss.item()))
             
             self.lam.append((1*self.lam[-1] + self.nu[-1]*constr_err).detach())
-            self.nu.append(torch.minimum(1.001*self.nu[-1],torch.tensor([1]).to(self.dev)))
+            self.nu.append(torch.minimum(1.0001*self.nu[-1],torch.tensor([1]).to(self.dev)))
             self.constr_err.append(constr_err.detach().cpu().numpy())
             self.costs.append(torch.mean( dQ_dQbar*cost ).detach().cpu().numpy())
             
             if np.mod(i+1,n_print) == 0:
                 self.plot_loss(self.theta['loss'],r"$loss_\omega$")
                 self.plot_mu()
-                # self.plot_sample_qpaths(eta, batch_size=1_000)
+                self.plot_sample_paths(batch_size=1_000)
                 f_err, g_err = self.estimate_errors(batch_size=1_000)
-                self.plot_sample_qpaths(1_000)
+                # self.plot_sample_qpaths(1_000)
                 print("\nerrors ", f_err, g_err)
             
     def estimate_errors(self, batch_size=1_000):
@@ -384,15 +384,16 @@ class sde_barycentre():
         self.eta = result
         
     #
-    def train(self, batch_size = 1024, n_iter_eta=1_000,  
-              n_iter_omega=1_000, n_print=100):
+    def train(self, batch_size = 1024, n_iter =1_000, n_print=100):
         
         self.X, self.var_sigma, self.dW = self.simulate_Qbar(batch_size=100_000)
         self.eta = []
         
         self.find_eta()
         
-        self.learn_theta(n_iter=n_iter_omega, n_print=n_print, batch_size=batch_size)
+        torch.cuda.empty_cache()
+        
+        self.learn_theta(n_iter=n_iter, n_print=n_print, batch_size=batch_size)
         
     
     def plot_sample_paths(self, batch_size = 4_096):
@@ -411,19 +412,22 @@ class sde_barycentre():
         """
         
         print('start sim')
-        X = self.simulate(batch_size).cpu().numpy()
+        X = self.simulate(batch_size)
+        Y = self.simulate_Q(batch_size=batch_size).unsqueeze(-1)
+        
+        X = torch.cat((X,Y),axis=-1).cpu().detach().numpy()
         
         print('done sim')
         
         
-        fig, axs = plt.subplots(self.d, self.K+1, figsize=(10, 5), sharex=True)
+        fig, axs = plt.subplots(self.d, X.shape[-1], figsize=(10, 5), sharex=True)
         
         if len(axs.shape)==1:
             axs = np.expand_dims(axs, axis=0)
         
         for i in range(self.d):
             
-            for k in range(self.K+1):
+            for k in range(X.shape[-1]):
                 
                 qtl = np.quantile(X[:,:,i,k], [0.1, 0.5, 0.9], axis=0)
                 axs[i,k].plot(self.t, X[:500,:,i,k].T, alpha=0.25, linewidth=1)
@@ -433,7 +437,8 @@ class sde_barycentre():
         for k in range(self.K):
             axs[0,k].set_title('model $\mathbb{P}_' + str(k) + '$')
         
-        axs[0,-1].set_title('model $\overline{\mathbb{P}}$')
+        axs[0,-2].set_title('model $\overline{\mathbb{P}}$')
+        axs[0,-1].set_title('model $\mathbb{Q}^*$')
         
         for i in range(self.d):
             axs[i,0].set_ylabel(r'$X_{' + str(i) +'}$')
@@ -470,8 +475,10 @@ class sde_barycentre():
         
         plt.fill_between(np.arange(len(mv)), y1=mv-mv_err, y2=mv+mv_err, alpha=0.2)
         plt.plot(mv,  linewidth=1.5)
-        plt.yscale('symlog')
+        plt.plot(x,  alpha=0.1)
+        plt.yscale('log')
         plt.title(title)
+        # plt.yticks([0.01,0.1,1])
         plt.show()
         
     def plot_sample_qpaths(self, batch_size = 4_096):
@@ -594,4 +601,45 @@ class sde_barycentre():
         makeplot(X)
         makeplot(X[draw])
         
-        return X[draw]        
+        return X[draw]  
+
+    def dQeta_dQbar(self, eta, t, X, var_sigma):
+        
+        # running constraints
+        int_g = 0
+        for k in range(len(self.g)):
+            int_g += eta[k]*torch.sum(self.dt*self.g[k](t[:,:-1,:], X[:,:-1,:]), axis=1)
+        
+        # terminal constraints
+        F = 0
+        for k in range(len(self.f)):
+            F += eta[len(self.g)+k]*self.f[k](X[:,-1,:])
+        
+        int_var_sigma = torch.sum(self.dt*var_sigma[:,:-1], axis=1).reshape(-1,1)
+        
+        dQ_dQbar = torch.exp(-F-int_g - int_var_sigma)
+        
+        # if self.eta is None:
+        #     self.dQ_dQbar_nrm = torch.mean(dQ_dQbar, axis=0)
+            
+        # dQ_dQbar = dQ_dQbar / self.dQ_dQbar_nrm
+        
+        dQ_dQbar = dQ_dQbar / torch.mean(dQ_dQbar, axis=0)
+        
+        return dQ_dQbar
+    
+    def plot_hist_measure_change(self):
+        
+        X, var_sigma, dW = self.simulate_Qbar(10_000)
+        t = torch.tensor(self.t).float().view(1,-1,1).repeat(X.shape[0],1,1).to(self.dev) 
+        
+        theta = self.theta['net'](torch.cat((t,X), axis=-1))
+        
+        log_dQ_dQbar = torch.log(self.get_stoch_exp(t, X, dW, theta)).detach().cpu()
+        log_dQeta_dQbar = torch.log(self.dQeta_dQbar(self.eta, t, X, var_sigma).reshape(-1)).detach().cpu()
+        
+        plt.hist(log_dQ_dQbar, bins=np.linspace(-8,5,51), alpha=0.5)
+        plt.hist(log_dQeta_dQbar, bins=np.linspace(-8,5,51), alpha=0.5)
+        plt.show()
+        
+        torch.cuda.empty_cache()
