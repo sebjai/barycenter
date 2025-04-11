@@ -1,0 +1,6 @@
+
+python=3.12
+spyder=6.0.3
+>conda install pytorch==2.5.1 pytorch-cuda=12.4 -c pytorch -c nvidia
+scipy
+matplotlib=v3.10.1

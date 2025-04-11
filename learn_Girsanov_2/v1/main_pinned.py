@@ -134,3 +134,16 @@ plt.xscale('log')
 # plt.xticks([1,10,100,1000,10000,20e3,40e3])
 plt.savefig('constraint.pdf',format='pdf',bbox_inches='tight')
 plt.show()
+
+#%%
+X = model.simulate(100_000)
+Y = torch.zeros(200000,1001)
+Y[:100000,:] = X[:,:,0,0]
+Y[100000:,:] = X[:,:,0,1]
+qtl = torch.quantile(Y,q=torch.linspace(0.1,0.9,9), dim=0)
+i = torch.randint(200_000,(200_000,))
+#%%
+plt.plot(model.t,qtl.T, color='gray', linewidth=1, alpha=0.5)
+plt.fill_between(model.t, qtl[0,:], qtl[-1,:], color='b', alpha=0.2)
+plt.plot(model.t,Y[i][:10,:].T, alpha=0.5, linewidth=0.5)
+plt.show()
